@@ -58,6 +58,61 @@ func (o *OpenAPIGen) AddGroup(group string, regex string) *OpenAPIGen {
 	return o
 }
 
+func (o *OpenAPIGen) walkInputFields(typ reflect.Type, visit func(field reflect.StructField) error) error {
+	if typ == nil {
+		return nil
+	}
+	if typ.Kind() == reflect.Ptr {
+		typ = typ.Elem()
+	}
+	if typ.Kind() != reflect.Struct {
+		return nil
+	}
+
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+
+		// unexported alanları atla
+		if f.PkgPath != "" {
+			continue
+		}
+
+		formFileTag := f.Tag.Get("formFile")
+		formTag := f.Tag.Get("form")
+		paramTag := f.Tag.Get("param")
+		queryTag := f.Tag.Get("query")
+		jsonTag := f.Tag.Get("json")
+
+		// Inner struct flatten koşulları:
+		// 1) embedded (anonymous)
+		// 2) wrapper field: json:"-" ve kendisi param/query/form tag taşımıyor (içine in)
+		ft := f.Type
+		if ft.Kind() == reflect.Ptr {
+			ft = ft.Elem()
+		}
+
+		shouldFlatten :=
+			(f.Anonymous && ft.Kind() == reflect.Struct) ||
+				(ft.Kind() == reflect.Struct &&
+					jsonTag == "-" &&
+					formFileTag == "" && formTag == "" && paramTag == "" && queryTag == "")
+
+		// time.Time gibi struct'lara dalma
+		if shouldFlatten && ft != reflect.TypeOf(time.Time{}) {
+			if err := o.walkInputFields(ft, visit); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if err := visit(f); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (o *OpenAPIGen) AddRoute(path string, method string, inputType reflect.Type, tag string) error {
 	operation := &openapi3.Operation{
 		Parameters: openapi3.Parameters{},
@@ -111,15 +166,16 @@ func (o *OpenAPIGen) AddRoute(path string, method string, inputType reflect.Type
 			}
 			actualSchema := componentSchemaRef.Value
 
-			hasJsonFields := false
-			for i := 0; i < typ.NumField(); i++ {
-				field := typ.Field(i)
+			hasJSONFields := false
+
+			err = o.walkInputFields(typ, func(field reflect.StructField) error {
 				formFileTag := field.Tag.Get("formFile")
 				formTag := field.Tag.Get("form")
 				paramTag := field.Tag.Get("param")
 				queryTag := field.Tag.Get("query")
 				jsonTag := field.Tag.Get("json")
 
+				// multipart/form-data (formFile / form)
 				if (formFileTag != "" && formFileTag != "-") || (formTag != "" && formTag != "-") {
 					if operation.RequestBody == nil {
 						operation.RequestBody = &openapi3.RequestBodyRef{
@@ -155,9 +211,10 @@ func (o *OpenAPIGen) AddRoute(path string, method string, inputType reflect.Type
 						}
 						existingSchema.Properties[formTag] = fieldSchema
 					}
-					continue
+					return nil
 				}
 
+				// path param
 				if paramTag != "" && paramTag != "-" {
 					paramName := paramTag
 					fieldSchemaRef, err := o.typeToSchema(field.Type)
@@ -165,6 +222,7 @@ func (o *OpenAPIGen) AddRoute(path string, method string, inputType reflect.Type
 						return fmt.Errorf("failed to generate schema for path parameter %s: %w", paramName, err)
 					}
 					parameter := openapi3.NewPathParameter(paramName).WithSchema(fieldSchemaRef.Value)
+
 					descriptionTag := field.Tag.Get("description")
 					if descriptionTag != "" {
 						parameter.Description = descriptionTag
@@ -178,14 +236,20 @@ func (o *OpenAPIGen) AddRoute(path string, method string, inputType reflect.Type
 						parsedExample, _ := parseExample(exampleTag, schemaTypeStr)
 						parameter.Example = parsedExample
 					}
+
 					operation.Parameters = append(operation.Parameters, &openapi3.ParameterRef{Value: parameter})
-				} else if queryTag != "" && queryTag != "-" {
+					return nil
+				}
+
+				// query param
+				if queryTag != "" && queryTag != "-" {
 					queryName := queryTag
 					fieldSchemaRef, err := o.typeToSchema(field.Type)
 					if err != nil {
 						return fmt.Errorf("failed to generate schema for query parameter %s: %w", queryName, err)
 					}
 					parameter := openapi3.NewQueryParameter(queryName).WithSchema(fieldSchemaRef.Value)
+
 					descriptionTag := field.Tag.Get("description")
 					if descriptionTag != "" {
 						parameter.Description = descriptionTag
@@ -199,13 +263,24 @@ func (o *OpenAPIGen) AddRoute(path string, method string, inputType reflect.Type
 						parsedExample, _ := parseExample(exampleTag, schemaTypeStr)
 						parameter.Example = parsedExample
 					}
+
 					operation.Parameters = append(operation.Parameters, &openapi3.ParameterRef{Value: parameter})
-				} else if jsonTag != "" && jsonTag != "-" {
-					hasJsonFields = true
+					return nil
 				}
+
+				// json body var mı?
+				if jsonTag != "" && jsonTag != "-" {
+					hasJSONFields = true
+				}
+
+				return nil
+			})
+
+			if err != nil {
+				return err
 			}
 
-			if hasJsonFields {
+			if hasJSONFields {
 				operation.RequestBody = &openapi3.RequestBodyRef{
 					Value: openapi3.NewRequestBody().WithContent(openapi3.NewContentWithJSONSchema(actualSchema)),
 				}
